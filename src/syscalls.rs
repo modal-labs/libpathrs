@@ -828,15 +828,13 @@ pub(crate) mod openat2 {
         // The kernel would reject a path with a NUL byte with EINVAL if it
         // could be passed; report the same rather than silently operating on a
         // path cut off at the NUL.
-        let Some(c_path) = path.to_c_string() else {
-            return Err(Error::Openat2 {
-                dirfd: dirfd.into(),
-                path: path.into(),
-                how,
-                size: std::mem::size_of::<OpenHow>(),
-                source: Errno::INVAL,
-            });
-        };
+        let c_path = path.to_c_string().map_err(|_| Error::Openat2 {
+            dirfd: dirfd.into(),
+            path: path.into(),
+            how,
+            size: std::mem::size_of::<OpenHow>(),
+            source: Errno::INVAL,
+        })?;
 
         // Add O_CLOEXEC and O_NOCTTY explicitly (as we do for openat). However,
         // O_NOCTTY cannot be set if O_PATH is set (openat2 verifies flag

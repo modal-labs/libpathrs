@@ -34,26 +34,31 @@ use crate::error::{Error, ErrorImpl};
 
 use std::{
     collections::VecDeque,
-    ffi::{CString, OsStr, OsString},
+    ffi::{CString, NulError, OsStr, OsString},
     os::unix::ffi::OsStrExt,
     path::Path,
 };
 
+// std::ffi::NulError has been stable since Rust 1.0; clippy's MSRV lint reads
+// the 1.64 stability attribute of the alloc::ffi definition it re-exports.
+#[allow(clippy::incompatible_msrv)]
 pub(crate) trait ToCString {
     /// Convert to a CStr. A path containing a NUL byte cannot be passed to the
-    /// kernel, so (as with `std::fs` and rustix) it yields `None` rather than
+    /// kernel, so (as with `std::fs` and rustix) it is an error rather than
     /// being cut off at the NUL.
-    fn to_c_string(&self) -> Option<CString>;
+    fn to_c_string(&self) -> Result<CString, NulError>;
 }
 
+#[allow(clippy::incompatible_msrv)]
 impl ToCString for OsStr {
-    fn to_c_string(&self) -> Option<CString> {
-        CString::new(self.as_bytes()).ok()
+    fn to_c_string(&self) -> Result<CString, NulError> {
+        CString::new(self.as_bytes())
     }
 }
 
+#[allow(clippy::incompatible_msrv)]
 impl ToCString for Path {
-    fn to_c_string(&self) -> Option<CString> {
+    fn to_c_string(&self) -> Result<CString, NulError> {
         self.as_os_str().to_c_string()
     }
 }
