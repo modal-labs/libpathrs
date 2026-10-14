@@ -47,6 +47,33 @@ use anyhow::{Context, Error};
 
 macro_rules! root_op_tests {
     ($(#[$meta:meta])* fn $test_name:ident ($root_var:ident) $body:block) => {
+        root_op_tests!{
+            $(#[$meta])*
+            @rust fn $test_name ($root_var) $body
+        }
+        paste::paste! {
+            #[test]
+            #[cfg(feature = "capi")]
+            $(#[$meta])*
+            fn [<capi_root_ $test_name>]() -> Result<(), Error> {
+                let root_dir = tests_common::create_basic_tree().context("create basic tree")?;
+                let $root_var = capi::CapiRoot::open(&root_dir).context("CapiRoot::open basic tree")?;
+
+                $body
+            }
+        }
+    };
+
+    // Only the Rust API variants, for cases the C API cannot express (such as
+    // a path with an interior NUL byte).
+    ($(#[$meta:meta])* @no-capi fn $test_name:ident ($root_var:ident) $body:block) => {
+        root_op_tests!{
+            $(#[$meta])*
+            @rust fn $test_name ($root_var) $body
+        }
+    };
+
+    ($(#[$meta:meta])* @rust fn $test_name:ident ($root_var:ident) $body:block) => {
         paste::paste! {
             #[test]
             $(#[$meta])*
@@ -145,16 +172,6 @@ macro_rules! root_op_tests {
                     $root_var.resolver_backend().supported(),
                     "emulated opath is always supported",
                 );
-
-                $body
-            }
-
-            #[test]
-            #[cfg(feature = "capi")]
-            $(#[$meta])*
-            fn [<capi_root_ $test_name>]() -> Result<(), Error> {
-                let root_dir = tests_common::create_basic_tree().context("create basic tree")?;
-                let $root_var = capi::CapiRoot::open(&root_dir).context("CapiRoot::open basic tree")?;
 
                 $body
             }
@@ -391,9 +408,32 @@ macro_rules! root_op_tests {
     };
 }
 
+// A path with an interior NUL byte cannot be passed to the kernel; it is
+// refused rather than cut off at the NUL. The C API cannot express such a
+// path, so only the Rust API is covered.
 root_op_tests! {
-    nul_byte_in_parent: mkfile("b\0x/file", 0o444) => Err(ErrorKind::OsError(Some(libc::EINVAL)));
-    nul_byte_in_name: mkfile("b/file\0x", 0o444) => Err(ErrorKind::OsError(Some(libc::EINVAL)));
+    @no-capi fn mkfile_nul_byte_in_parent(root) {
+        utils::check_root_create(
+            &root,
+            "b\0x/file",
+            InodeType::File(Permissions::from_mode(0o444)),
+            Err(ErrorKind::OsError(Some(libc::EINVAL))),
+        )
+    }
+}
+
+root_op_tests! {
+    @no-capi fn mkfile_nul_byte_in_name(root) {
+        utils::check_root_create(
+            &root,
+            "b/file\0x",
+            InodeType::File(Permissions::from_mode(0o444)),
+            Err(ErrorKind::OsError(Some(libc::EINVAL))),
+        )
+    }
+}
+
+root_op_tests! {
     plain: mkfile("abc", 0o444) => Ok(("abc", libc::S_IFREG | 0o444));
     exist_file: mkfile("b/c/file", 0o444) => Err(ErrorKind::OsError(Some(libc::EEXIST)));
     exist_dir: mkfile("a", 0o444) => Err(ErrorKind::OsError(Some(libc::EEXIST)));
