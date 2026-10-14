@@ -414,7 +414,7 @@ macro_rules! root_op_tests {
 root_op_tests! {
     @no-capi fn mkfile_nul_byte_in_parent(root) {
         utils::check_root_create(
-            &root,
+            root,
             "b\0x/file",
             InodeType::File(Permissions::from_mode(0o444)),
             Err(ErrorKind::OsError(Some(libc::EINVAL))),
@@ -425,7 +425,7 @@ root_op_tests! {
 root_op_tests! {
     @no-capi fn mkfile_nul_byte_in_name(root) {
         utils::check_root_create(
-            &root,
+            root,
             "b/file\0x",
             InodeType::File(Permissions::from_mode(0o444)),
             Err(ErrorKind::OsError(Some(libc::EINVAL))),
