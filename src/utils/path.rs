@@ -40,24 +40,20 @@ use std::{
 };
 
 pub(crate) trait ToCString {
-    /// Convert to a CStr.
-    fn to_c_string(&self) -> CString;
+    /// Convert to a CStr. A path containing a NUL byte cannot be passed to the
+    /// kernel, so (as with `std::fs` and rustix) it yields `None` rather than
+    /// being cut off at the NUL.
+    fn to_c_string(&self) -> Option<CString>;
 }
 
 impl ToCString for OsStr {
-    fn to_c_string(&self) -> CString {
-        let filtered: Vec<_> = self
-            .as_bytes()
-            .iter()
-            .copied()
-            .take_while(|&c| c != b'\0')
-            .collect();
-        CString::new(filtered).expect("nul bytes should've been excluded")
+    fn to_c_string(&self) -> Option<CString> {
+        CString::new(self.as_bytes()).ok()
     }
 }
 
 impl ToCString for Path {
-    fn to_c_string(&self) -> CString {
+    fn to_c_string(&self) -> Option<CString> {
         self.as_os_str().to_c_string()
     }
 }

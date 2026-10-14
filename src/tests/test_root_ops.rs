@@ -392,6 +392,8 @@ macro_rules! root_op_tests {
 }
 
 root_op_tests! {
+    nul_byte_in_parent: mkfile("b\0x/file", 0o444) => Err(ErrorKind::OsError(Some(libc::EINVAL)));
+    nul_byte_in_name: mkfile("b/file\0x", 0o444) => Err(ErrorKind::OsError(Some(libc::EINVAL)));
     plain: mkfile("abc", 0o444) => Ok(("abc", libc::S_IFREG | 0o444));
     exist_file: mkfile("b/c/file", 0o444) => Err(ErrorKind::OsError(Some(libc::EEXIST)));
     exist_dir: mkfile("a", 0o444) => Err(ErrorKind::OsError(Some(libc::EEXIST)));

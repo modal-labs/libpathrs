@@ -825,6 +825,18 @@ pub(crate) mod openat2 {
     ) -> Result<OwnedFd, Error> {
         let dirfd = dirfd.as_fd().check_rustix_fd()?;
         let path = path.as_ref();
+        // The kernel would reject a path with a NUL byte with EINVAL if it
+        // could be passed; report the same rather than silently operating on a
+        // path cut off at the NUL.
+        let Some(c_path) = path.to_c_string() else {
+            return Err(Error::Openat2 {
+                dirfd: dirfd.into(),
+                path: path.into(),
+                how,
+                size: std::mem::size_of::<OpenHow>(),
+                source: Errno::INVAL,
+            });
+        };
 
         // Add O_CLOEXEC and O_NOCTTY explicitly (as we do for openat). However,
         // O_NOCTTY cannot be set if O_PATH is set (openat2 verifies flag
@@ -851,7 +863,7 @@ pub(crate) mod openat2 {
                 libc::syscall(
                     libc::SYS_openat2,
                     dirfd.as_raw_fd(),
-                    path.to_c_string().as_ptr(),
+                    c_path.as_ptr(),
                     &how as *const OpenHow,
                     std::mem::size_of::<OpenHow>(),
                 )
