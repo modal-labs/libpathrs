@@ -36,6 +36,7 @@ use crate::{
     procfs,
     syscalls::{self, OpenHow, ResolveFlags},
     utils::{fd::proc_threadself_subpath, FdExt, MaybeOwnedFd},
+    RetryPolicy,
 };
 
 use std::{
@@ -77,9 +78,9 @@ pub(crate) enum RawProcfsRoot<'fd> {
     UnsafeGlobal,
 
     /// Use this [`BorrowedFd`] as the rootfs of a proc and operate relative to
-    /// it. This is still somewhat unsafe, depending on what kernel features are
-    /// available.
-    UnsafeFd(BorrowedFd<'fd>),
+    /// it, using the supplied retry policy for scoped lookups. This is still
+    /// somewhat unsafe, depending on what kernel features are available.
+    UnsafeFd(BorrowedFd<'fd>, RetryPolicy),
 }
 
 impl<'fd> RawProcfsRoot<'fd> {
@@ -105,7 +106,7 @@ impl<'fd> RawProcfsRoot<'fd> {
                     source: err,
                 })?,
             ),
-            Self::UnsafeFd(fd) => MaybeOwnedFd::BorrowedFd(*fd),
+            Self::UnsafeFd(fd, _) => MaybeOwnedFd::BorrowedFd(*fd),
         };
         procfs::verify_is_procfs_root(fd.as_fd())?;
         Ok(fd)
@@ -144,17 +145,22 @@ impl<'fd> RawProcfsRoot<'fd> {
     fn openat2_beneath(&self, path: impl AsRef<Path>, oflags: OpenFlags) -> Result<OwnedFd, Error> {
         let path = path.as_ref();
 
-        syscalls::openat2(
+        let retry_policy = match self {
+            Self::UnsafeGlobal => RetryPolicy::default(),
+            Self::UnsafeFd(_, policy) => *policy,
+        };
+        syscalls::openat2_follow_with_retry(
             self.try_into_maybe_owned_fd()?.as_fd(),
             path,
             OpenHow {
-                flags: oflags,
+                flags: oflags | OpenFlags::O_NOFOLLOW,
                 mode: 0,
                 resolve: (ResolveFlags::RESOLVE_NO_MAGICLINKS
                     | ResolveFlags::RESOLVE_NO_XDEV
                     | ResolveFlags::RESOLVE_BENEATH)
                     .bits(),
             },
+            retry_policy,
         )
         .map_err(|err| {
             ErrorImpl::RawOsError {

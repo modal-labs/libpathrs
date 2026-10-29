@@ -125,6 +125,8 @@ pub struct Resolver {
     pub(crate) backend: ResolverBackend,
     /// Flags to pass to the resolution backend.
     pub flags: ResolverFlags,
+    /// Retry policy for scoped openat2 lookups.
+    pub retry_policy: crate::RetryPolicy,
 }
 
 /// Only used for internal resolver implementations.
@@ -288,7 +290,7 @@ impl Resolver {
                 let root = root.as_fd();
                 let path = path.as_ref();
 
-                openat2::open(root, path, self.flags, flags).or_else(|err| {
+                openat2::open(root, path, self.flags, flags, self.retry_policy).or_else(|err| {
                     // If an error occurred, it could be due to openat2(2) being
                     // disabled via seccomp or just being unsupported. We check
                     // this via a dummy openat2(2) chall -- if that fails then
@@ -321,7 +323,14 @@ impl Resolver {
             ResolverBackend::KernelOpenat2 => {
                 let root = root.as_fd();
                 let path = path.as_ref();
-                openat2::resolve(root, path, self.flags, no_follow_trailing).or_else(|err| {
+                openat2::resolve(
+                    root,
+                    path,
+                    self.flags,
+                    no_follow_trailing,
+                    self.retry_policy,
+                )
+                .or_else(|err| {
                     // If an error occurred, it could be due to openat2(2) being
                     // disabled via seccomp or just being unsupported. We check
                     // this via a dummy openat2(2) chall -- if that fails then
@@ -354,7 +363,14 @@ impl Resolver {
             ResolverBackend::KernelOpenat2 => {
                 let root = root.as_fd();
                 let path = path.as_ref();
-                openat2::resolve_partial(root, path, self.flags, no_follow_trailing).or_else(
+                openat2::resolve_partial(
+                    root,
+                    path,
+                    self.flags,
+                    no_follow_trailing,
+                    self.retry_policy,
+                )
+                .or_else(
                     // If an error occurred, it could be due to openat2(2) being
                     // disabled via seccomp or just being unsupported. We check
                     // this via a dummy openat2(2) chall -- if that fails then
