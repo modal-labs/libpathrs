@@ -38,7 +38,7 @@ use crate::{
     resolvers::Resolver,
     syscalls::{self, FrozenFd},
     utils::{self, PathIterExt},
-    Handle,
+    Handle, RetryPolicy,
 };
 
 use std::{
@@ -216,6 +216,44 @@ impl Root {
             inner: self.as_fd(),
             resolver: self.resolver,
         }
+    }
+
+    /// Get the retry policy for scoped `openat2(2)` lookups in this [`Root`].
+    #[inline]
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.resolver.retry_policy
+    }
+
+    /// Set the retry policy for scoped `openat2(2)` lookups in this [`Root`].
+    ///
+    /// The policy is copied when borrowing or cloning a handle. Changing it
+    /// only affects this instance. See [`RetryPolicy`] for the retry scope.
+    #[inline]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.resolver.retry_policy = policy;
+        self
+    }
+
+    /// Configure retries for scoped `openat2(2)` lookups in this [`Root`].
+    ///
+    /// This is the chaining form of [`Root::set_retry_policy`]:
+    ///
+    /// ```rust
+    /// # use pathrs::{Root, RetryPolicy};
+    /// # let tmpdir = tempfile::TempDir::new()?;
+    /// let root = Root::open(&tmpdir)?
+    ///     .with_retry_policy(RetryPolicy::Count(1024));
+    /// let handle = root.resolve(".")?;
+    /// # let _ = handle;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// To configure a single operation, use [`Root::as_ref`] and
+    /// [`RootRef::with_retry_policy`].
+    #[inline]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.set_retry_policy(policy);
+        self
     }
 
     /// Get the current [`ResolverFlags`] for this [`Root`].
@@ -590,6 +628,46 @@ impl RootRef<'_> {
             inner,
             resolver: Default::default(),
         }
+    }
+
+    /// Get the retry policy for scoped `openat2(2)` lookups in this
+    /// [`RootRef`].
+    #[inline]
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.resolver.retry_policy
+    }
+
+    /// Set the retry policy for scoped `openat2(2)` lookups in this
+    /// [`RootRef`].
+    ///
+    /// The policy is copied when borrowing or cloning a handle. Changing it
+    /// only affects this instance. See [`RetryPolicy`] for the retry scope.
+    #[inline]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.resolver.retry_policy = policy;
+        self
+    }
+
+    /// Configure retries for scoped `openat2(2)` lookups in this [`RootRef`].
+    ///
+    /// This is the chaining form of [`RootRef::set_retry_policy`]. A temporary
+    /// [`RootRef`] can be used to configure a single operation without changing
+    /// the original [`Root`]:
+    ///
+    /// ```rust
+    /// # use pathrs::{Root, RetryPolicy};
+    /// # let tmpdir = tempfile::TempDir::new()?;
+    /// let root = Root::open(&tmpdir)?;
+    /// let handle = root.as_ref()
+    ///     .with_retry_policy(RetryPolicy::Count(1024))
+    ///     .resolve(".")?;
+    /// # let _ = handle;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    #[inline]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.set_retry_policy(policy);
+        self
     }
 
     /// Get the current [`ResolverFlags`] for this [`RootRef`].
@@ -1455,12 +1533,71 @@ impl AsFd for RootRef<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{resolvers::ResolverBackend, Root, RootRef};
+    use crate::{resolvers::ResolverBackend, RetryPolicy, Root, RootRef};
 
     use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
 
     use anyhow::Error;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn retry_policy_inheritance() -> Result<(), Error> {
+        let mut root = Root::open(".")?;
+        assert_eq!(root.retry_policy(), RetryPolicy::default());
+        root.set_retry_policy(RetryPolicy::Count(1024));
+        let cloned = root.try_clone()?;
+        let borrowed = root.as_ref();
+        assert_eq!(borrowed.retry_policy(), RetryPolicy::Count(1024));
+        assert_eq!(
+            borrowed.try_clone()?.retry_policy(),
+            RetryPolicy::Count(1024)
+        );
+
+        let mut temporary = borrowed.with_retry_policy(RetryPolicy::Count(0));
+        assert_eq!(temporary.retry_policy(), RetryPolicy::Count(0));
+        temporary.set_retry_policy(RetryPolicy::Count(2));
+        assert_eq!(temporary.try_clone()?.retry_policy(), RetryPolicy::Count(2));
+        assert_eq!(borrowed.retry_policy(), RetryPolicy::Count(1024));
+        assert_eq!(root.retry_policy(), RetryPolicy::Count(1024));
+        assert_eq!(
+            RootRef::from_fd(root.as_fd()).retry_policy(),
+            RetryPolicy::default()
+        );
+
+        root.set_retry_policy(RetryPolicy::Count(1));
+        assert_eq!(cloned.retry_policy(), RetryPolicy::Count(1024));
+        assert_eq!(root.retry_policy(), RetryPolicy::Count(1));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_root_operations() -> Result<(), Error> {
+        use crate::flags::OpenFlags;
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt, time::Duration};
+
+        for backend in [
+            ResolverBackend::KernelOpenat2,
+            ResolverBackend::EmulatedOpath,
+        ] {
+            for policy in [
+                RetryPolicy::Count(1024),
+                RetryPolicy::Timeout(Duration::from_millis(10)),
+            ] {
+                let dir = tempfile::TempDir::new()?;
+                let root = Root::open(&dir)?
+                    .with_resolver_backend(backend)
+                    .with_retry_policy(policy);
+                let perm = Permissions::from_mode(0o700);
+                root.mkdir_all("a/b/c", &perm)?;
+                root.resolve("a/b/c")?;
+                root.resolve_nofollow("a/b/c")?;
+                root.open_subpath("a/b/c", OpenFlags::O_PATH)?;
+                root.create_file("a/b/c/file", OpenFlags::O_RDWR, &perm)?;
+                root.remove_all("a")?;
+            }
+        }
+        Ok(())
+    }
 
     impl Root {
         // TODO: Should we make this public? Is there any real benefit?

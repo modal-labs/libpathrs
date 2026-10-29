@@ -49,6 +49,7 @@ use crate::{
     resolvers::MAX_SYMLINK_TRAVERSALS,
     syscalls::{self, OpenHow},
     utils::{self, FdExt, PathIterExt, RawProcfsRoot},
+    RetryPolicy,
 };
 
 use std::{
@@ -91,6 +92,7 @@ impl ProcfsResolver {
         path: impl AsRef<Path>,
         oflags: OpenFlags,
         rflags: ResolverFlags,
+        retry_policy: RetryPolicy,
     ) -> Result<OwnedFd, Error> {
         // These flags don't make sense for procfs and will just result in
         // confusing errors during lookup. O_TMPFILE contains multiple flags
@@ -111,21 +113,24 @@ impl ProcfsResolver {
         let path = path.as_ref();
 
         match *self {
-            Self::Openat2 => openat2_resolve(root, path, oflags, rflags).or_else(|err| {
-                // If an error occurred, it could be due to openat2(2) being
-                // disabled via seccomp or just being unsupported. We check this
-                // via a dummy openat2(2) chall -- if that fails then we
-                // fallback to O_PATH, otherwise we assume openat2(2) failed for
-                // a good reason and return that error outright.
-                //
-                // TODO: Find a way to make this fallback logic a bit less
-                //       repetitive of the other match arm.
-                if syscalls::openat2::openat2_is_not_supported() {
-                    opath_resolve(proc_rootfd, root, path, oflags, rflags)
-                } else {
-                    Err(err)
-                }
-            }),
+            Self::Openat2 => {
+                openat2_resolve(root, path, oflags, rflags, retry_policy).or_else(|err| {
+                    // If an error occurred, it could be due to openat2(2) being
+                    // disabled via seccomp or just being unsupported. We check
+                    // this via a dummy openat2(2) chall --
+                    // if that fails then we fallback to
+                    // O_PATH, otherwise we assume openat2(2) failed for
+                    // a good reason and return that error outright.
+                    //
+                    // TODO: Find a way to make this fallback logic a bit less
+                    //       repetitive of the other match arm.
+                    if syscalls::openat2::openat2_is_not_supported() {
+                        opath_resolve(proc_rootfd, root, path, oflags, rflags)
+                    } else {
+                        Err(err)
+                    }
+                })
+            }
             Self::RestrictedOpath => opath_resolve(proc_rootfd, root, path, oflags, rflags),
         }
     }
@@ -139,12 +144,13 @@ fn openat2_resolve(
     path: impl AsRef<Path>,
     oflags: OpenFlags,
     rflags: ResolverFlags,
+    retry_policy: RetryPolicy,
 ) -> Result<OwnedFd, Error> {
     // Copy the RESOLVE_NO_SYMLINKS bit from rflags.
     let rflags =
         libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV | rflags.bits();
 
-    syscalls::openat2_follow(
+    syscalls::openat2_follow_with_retry(
         root,
         path,
         OpenHow {
@@ -152,6 +158,7 @@ fn openat2_resolve(
             resolve: rflags,
             ..Default::default()
         },
+        retry_policy,
     )
     .map_err(|err| {
         ErrorImpl::RawOsError {
@@ -565,7 +572,7 @@ mod tests {
                     let expected: ExpectedResult = $expected_result.map(|p: PathBuf| root_dir.join(p));
                     let oflags = $(OpenFlags::$oflag)|*;
                     let res = ProcfsResolver::Openat2
-                        .resolve(RawProcfsRoot::UnsafeGlobal, &root, &$path_var, oflags, $rflags)
+                        .resolve(RawProcfsRoot::UnsafeGlobal, &root, &$path_var, oflags, $rflags, crate::RetryPolicy::default())
                         .as_ref()
                         .map(|f| {
                             f.as_unsafe_path_unchecked()
@@ -589,7 +596,7 @@ mod tests {
                     let expected: ExpectedResult = $expected_result.map(|p: PathBuf| root_dir.join(p));
                     let oflags = $(OpenFlags::$oflag)|*;
                     let res = ProcfsResolver::RestrictedOpath
-                        .resolve(RawProcfsRoot::UnsafeGlobal, &root, &$path_var, oflags, $rflags)
+                        .resolve(RawProcfsRoot::UnsafeGlobal, &root, &$path_var, oflags, $rflags, crate::RetryPolicy::default())
                         .as_ref()
                         .map(|f| {
                             f.as_unsafe_path_unchecked()

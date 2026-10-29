@@ -107,6 +107,7 @@ impl RootImpl for Root {
         Resolver {
             backend: self.resolver_backend(),
             flags: self.resolver_flags(),
+            retry_policy: self.retry_policy(),
         }
     }
 
@@ -114,6 +115,7 @@ impl RootImpl for Root {
         Self::Cloned::from_fd(fd)
             .with_resolver_backend(resolver.backend)
             .with_resolver_flags(resolver.flags)
+            .with_retry_policy(resolver.retry_policy)
     }
 
     fn try_clone(&self) -> Result<Self::Cloned, anyhow::Error> {
@@ -192,6 +194,7 @@ impl RootImpl for &Root {
         Resolver {
             backend: self.resolver_backend(),
             flags: self.resolver_flags(),
+            retry_policy: self.retry_policy(),
         }
     }
 
@@ -199,6 +202,7 @@ impl RootImpl for &Root {
         Self::Cloned::from_fd(fd)
             .with_resolver_backend(resolver.backend)
             .with_resolver_flags(resolver.flags)
+            .with_retry_policy(resolver.retry_policy)
     }
 
     fn try_clone(&self) -> Result<Self::Cloned, anyhow::Error> {
@@ -277,6 +281,7 @@ impl RootImpl for RootRef<'_> {
         Resolver {
             backend: self.resolver_backend(),
             flags: self.resolver_flags(),
+            retry_policy: self.retry_policy(),
         }
     }
 
@@ -284,6 +289,7 @@ impl RootImpl for RootRef<'_> {
         Self::Cloned::from_fd(fd)
             .with_resolver_backend(resolver.backend)
             .with_resolver_flags(resolver.flags)
+            .with_retry_policy(resolver.retry_policy)
     }
 
     fn try_clone(&self) -> Result<Self::Cloned, anyhow::Error> {
@@ -362,6 +368,7 @@ impl RootImpl for &RootRef<'_> {
         Resolver {
             backend: self.resolver_backend(),
             flags: self.resolver_flags(),
+            retry_policy: self.retry_policy(),
         }
     }
 
@@ -369,6 +376,7 @@ impl RootImpl for &RootRef<'_> {
         Self::Cloned::from_fd(fd)
             .with_resolver_backend(resolver.backend)
             .with_resolver_flags(resolver.flags)
+            .with_retry_policy(resolver.retry_policy)
     }
 
     fn try_clone(&self) -> Result<Self::Cloned, anyhow::Error> {

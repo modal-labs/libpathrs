@@ -64,6 +64,7 @@ use crate::{
     resolvers::procfs::ProcfsResolver,
     syscalls,
     utils::{self, kernel_version, FdExt, MaybeOwnedFd, RawProcfsRoot},
+    RetryPolicy,
 };
 
 use std::{
@@ -230,6 +231,7 @@ impl ProcfsBase {
 #[derive(Clone, Debug)]
 pub struct ProcfsHandleBuilder {
     subset_pid: bool,
+    retry_policy: RetryPolicy,
 }
 
 impl Default for ProcfsHandleBuilder {
@@ -243,7 +245,28 @@ impl ProcfsHandleBuilder {
     /// configuration.
     #[inline]
     pub fn new() -> Self {
-        Self { subset_pid: true }
+        Self {
+            subset_pid: true,
+            retry_policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Configure retries for scoped `openat2(2)` lookups on the built handle.
+    ///
+    /// The policy belongs to the returned handle, even when its underlying
+    /// file descriptor is cached. Handle construction uses the default policy.
+    /// See [`RetryPolicy`] for the retry scope.
+    #[inline]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.set_retry_policy(policy);
+        self
+    }
+
+    /// Setter form of [`ProcfsHandleBuilder::retry_policy`].
+    #[inline]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.retry_policy = policy;
+        self
     }
 
     // TODO: use_cached() -- allow users to control whether they get a cached
@@ -338,6 +361,11 @@ impl ProcfsHandleBuilder {
     /// handles. Users are still strongly recommended to not fiddle with file
     /// descriptors in that way (unless absolutely necessary).
     pub fn build(self) -> Result<ProcfsHandle, Error> {
+        self.build_handle()
+            .map(|handle| handle.with_retry_policy(self.retry_policy))
+    }
+
+    fn build_handle(&self) -> Result<ProcfsHandle, Error> {
         // MSRV(1.70): Use std::sync::OnceLock.
         static CACHED_PROCFS_HANDLE: OnceLock<OwnedFd> = OnceLock::new();
         static CACHED_HANDLE_IS_BAD: OnceLock<()> = OnceLock::new();
@@ -422,6 +450,7 @@ pub struct ProcfsHandleRef<'fd> {
     is_subset: bool,
     is_detached: bool,
     pub(crate) resolver: ProcfsResolver,
+    retry_policy: RetryPolicy,
 }
 
 /// > **NOTE**: Take great care when using this file descriptor -- it is very
@@ -436,6 +465,49 @@ impl<'fd> AsFd for ProcfsHandleRef<'fd> {
 }
 
 impl<'fd> ProcfsHandleRef<'fd> {
+    /// Get the retry policy for scoped `openat2(2)` lookups on this handle.
+    #[inline]
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy
+    }
+
+    /// Set the retry policy for scoped `openat2(2)` lookups on this handle.
+    ///
+    /// This only affects this instance, including temporary unmasked handles
+    /// created for its operations. Other handles sharing a cached file
+    /// descriptor are unaffected. See [`RetryPolicy`] for the retry scope.
+    #[inline]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Configure retries for scoped `openat2(2)` lookups on this handle.
+    ///
+    /// This is the chaining form of [`Self::set_retry_policy`].
+    ///
+    /// ```rust
+    /// # use pathrs::{RetryPolicy, procfs::{ProcfsHandle, ProcfsBase}, flags::OpenFlags};
+    /// # use std::time::Duration;
+    /// let procfs = ProcfsHandle::new()?
+    ///     .with_retry_policy(RetryPolicy::Timeout(Duration::from_millis(10)));
+    /// let status = procfs.open(ProcfsBase::ProcSelf, "status", OpenFlags::O_RDONLY)?;
+    /// # let _ = status;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    #[inline]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.set_retry_policy(policy);
+        self
+    }
+
+    fn unmasked_handle(&self) -> Result<ProcfsHandle, Error> {
+        ProcfsHandleBuilder::new()
+            .unmasked()
+            .retry_policy(self.retry_policy)
+            .build()
+    }
+
     // This is part of Linux's ABI.
     const PROC_ROOT_INO: u64 = 1;
 
@@ -456,7 +528,7 @@ impl<'fd> ProcfsHandleRef<'fd> {
     }
 
     pub(crate) fn as_raw_procfs(&self) -> RawProcfsRoot<'_> {
-        RawProcfsRoot::UnsafeFd(self.as_fd())
+        RawProcfsRoot::UnsafeFd(self.as_fd(), self.retry_policy)
     }
 
     /// Do `openat(2)` inside the procfs, but safely.
@@ -472,6 +544,7 @@ impl<'fd> ProcfsHandleRef<'fd> {
             subpath,
             oflags,
             ResolverFlags::empty(),
+            self.retry_policy,
         )?;
         self.verify_same_procfs_mnt(&fd).with_wrap(|| {
             format!(
@@ -546,9 +619,8 @@ impl<'fd> ProcfsHandleRef<'fd> {
                     // If the trial lookup failed due to ENOENT and the current
                     // procfs handle is "masked" in some way, try to create a
                     // temporary unmasked handle and retry the operation.
-                    return ProcfsHandleBuilder::new()
-                        .unmasked()
-                        .build()
+                    return self
+                        .unmasked_handle()
                         // Use the old error if creating a new handle failed.
                         .or(Err(err))?
                         .open_follow(base, subpath, oflags);
@@ -675,9 +747,7 @@ impl<'fd> ProcfsHandleRef<'fd> {
                     // If the lookup failed due to ENOENT, and the current
                     // procfs handle is "masked" in some way, try to create a
                     // temporary unmasked handle and retry the operation.
-                    ProcfsHandleBuilder::new()
-                        .unmasked()
-                        .build()
+                    self.unmasked_handle()
                         // Use the old error if creating a new handle failed.
                         .or(Err(err))?
                         .open(base, subpath, oflags)
@@ -733,7 +803,7 @@ impl<'fd> ProcfsHandleRef<'fd> {
             )
         })?;
 
-        let proc_rootfd = RawProcfsRoot::UnsafeFd(inner_fd);
+        let proc_rootfd = RawProcfsRoot::UnsafeFd(inner_fd, RetryPolicy::default());
         let mnt_id = utils::fetch_mnt_id(proc_rootfd, inner_fd, "").with_wrap(|| {
             format!(
                 "get mount id for candidate procfs root fd {}",
@@ -783,6 +853,7 @@ impl<'fd> ProcfsHandleRef<'fd> {
             is_subset,
             is_detached,
             resolver,
+            retry_policy: RetryPolicy::default(),
         })
     }
 }
@@ -1072,6 +1143,58 @@ mod tests {
     use std::{fs::File, os::unix::io::AsRawFd};
 
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn retry_policy_is_per_handle() -> Result<(), Error> {
+        let policy = RetryPolicy::Count(1024);
+        let mut builder = ProcfsHandleBuilder::new();
+        builder.set_retry_policy(policy);
+        let mut first = builder.clone().build()?;
+        let second = builder.build()?;
+        assert_eq!(first.retry_policy(), policy);
+        assert_eq!(second.retry_policy(), policy);
+        if first.is_detached && first.is_subset {
+            assert_eq!(first.as_fd().as_raw_fd(), second.as_fd().as_raw_fd());
+        }
+        first.set_retry_policy(RetryPolicy::Count(1));
+        assert_eq!(first.retry_policy(), RetryPolicy::Count(1));
+        assert!(matches!(
+            first.as_raw_procfs(),
+            RawProcfsRoot::UnsafeFd(_, RetryPolicy::Count(1))
+        ));
+        assert_eq!(second.retry_policy(), policy);
+        assert_eq!(ProcfsHandle::new()?.retry_policy(), RetryPolicy::default());
+        assert_eq!(
+            ProcfsHandleRef::try_from_borrowed_fd(first.as_fd())?.retry_policy(),
+            RetryPolicy::default()
+        );
+        // Both masked-open fallback paths use this helper to create a handle
+        // with the original policy, without changing the cached default.
+        assert_eq!(
+            first.unmasked_handle()?.retry_policy(),
+            RetryPolicy::Count(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_procfs_operations() -> Result<(), Error> {
+        use std::time::Duration;
+
+        for resolver in [ProcfsResolver::Openat2, ProcfsResolver::RestrictedOpath] {
+            let policy = RetryPolicy::Timeout(Duration::from_millis(10));
+            let mut procfs = ProcfsHandleBuilder::new().retry_policy(policy).build()?;
+            procfs.resolver = resolver;
+            procfs.open(ProcfsBase::ProcSelf, "status", OpenFlags::O_RDONLY)?;
+            procfs.open_follow(ProcfsBase::ProcSelf, "exe", OpenFlags::O_PATH)?;
+            procfs.readlink(ProcfsBase::ProcSelf, "exe")?;
+            // On subset=pid mounts these operations need an unmasked handle.
+            procfs.open(ProcfsBase::ProcRoot, "stat", OpenFlags::O_RDONLY)?;
+            procfs.open_follow(ProcfsBase::ProcRoot, "stat", OpenFlags::O_RDONLY)?;
+            assert_eq!(procfs.retry_policy(), policy);
+        }
+        Ok(())
+    }
 
     #[test]
     fn bad_root() {

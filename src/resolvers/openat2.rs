@@ -36,7 +36,7 @@ use crate::{
     resolvers::PartialLookup,
     syscalls::{self, OpenHow},
     utils::PathIterExt,
-    Handle,
+    Handle, RetryPolicy,
 };
 
 use std::{
@@ -53,6 +53,7 @@ pub(crate) fn open(
     path: impl AsRef<Path>,
     rflags: ResolverFlags,
     oflags: OpenFlags,
+    retry_policy: RetryPolicy,
 ) -> Result<File, Error> {
     let rflags = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS | rflags.bits();
     let how = OpenHow {
@@ -61,7 +62,7 @@ pub(crate) fn open(
         ..Default::default()
     };
 
-    syscalls::openat2_follow(&root, path.as_ref(), how)
+    syscalls::openat2_follow_with_retry(&root, path.as_ref(), how, retry_policy)
         .map(File::from)
         .map_err(|err| {
             ErrorImpl::RawOsError {
@@ -78,6 +79,7 @@ pub(crate) fn resolve(
     path: impl AsRef<Path>,
     rflags: ResolverFlags,
     no_follow_trailing: bool,
+    retry_policy: RetryPolicy,
 ) -> Result<Handle, Error> {
     // Copy the O_NOFOLLOW and RESOLVE_NO_SYMLINKS bits from flags.
     let mut oflags = OpenFlags::O_PATH;
@@ -92,7 +94,7 @@ pub(crate) fn resolve(
         ..Default::default()
     };
 
-    syscalls::openat2_follow(&root, path.as_ref(), how)
+    syscalls::openat2_follow_with_retry(&root, path.as_ref(), how, retry_policy)
         .map(Handle::from_fd)
         .map_err(|err| {
             ErrorImpl::RawOsError {
@@ -110,11 +112,12 @@ pub(crate) fn resolve_partial(
     path: impl AsRef<Path>,
     rflags: ResolverFlags,
     no_follow_trailing: bool,
+    retry_policy: RetryPolicy,
 ) -> Result<PartialLookup<Handle>, Error> {
     let root = root.as_fd();
     let path = path.as_ref();
 
-    let mut last_error = match resolve(root, path, rflags, no_follow_trailing) {
+    let mut last_error = match resolve(root, path, rflags, no_follow_trailing, retry_policy) {
         Ok(handle) => return Ok(PartialLookup::Complete(handle)),
         Err(err) => err,
     };
@@ -131,7 +134,7 @@ pub(crate) fn resolve_partial(
             // being exploited to return some result to Root::mkdir_all).
             return Err(last_error);
         }
-        match resolve(root, path, rflags, no_follow_trailing) {
+        match resolve(root, path, rflags, no_follow_trailing, retry_policy) {
             Ok(handle) => {
                 return Ok(PartialLookup::Partial {
                     handle,

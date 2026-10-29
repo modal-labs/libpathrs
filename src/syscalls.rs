@@ -834,7 +834,16 @@ pub(crate) mod openat2 {
     pub(crate) fn openat2_follow(
         dirfd: impl AsFd,
         path: impl AsRef<Path>,
+        how: OpenHow,
+    ) -> Result<OwnedFd, Error> {
+        openat2_follow_with_retry(dirfd, path, how, crate::RetryPolicy::default())
+    }
+
+    pub(crate) fn openat2_follow_with_retry(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
         mut how: OpenHow,
+        retry_policy: crate::RetryPolicy,
     ) -> Result<OwnedFd, Error> {
         let dirfd = dirfd.as_fd().check_rustix_fd()?;
         let path = path.as_ref();
@@ -861,66 +870,39 @@ pub(crate) mod openat2 {
             how.flags.insert(OpenFlags::O_NOCTTY);
         }
 
-        // openat2(2) can fail with -EAGAIN if there was a racing rename or
-        // mount *anywhere on the system*. This can happen pretty frequently, so
-        // what we do is attempt the openat2(2) a couple of times.
-        //
-        // Based on some fairly extensive tests, with 128 retries you only have
-        // a ~0.1% chance of hitting the error path (even with an attacker
-        // pounding on rename on all cores). Users that need stricter retry
-        // requirements can do their own higher-level retry loop based on the
-        // errno.
-        const MAX_RETRIES: u8 = 128;
-        let mut tries = 0u8;
-        let (fd, err) = loop {
-            // SAFETY: Obviously safe-to-use Linux syscall.
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    dirfd.as_raw_fd(),
-                    c_path.as_ptr(),
-                    &how as *const OpenHow,
-                    std::mem::size_of::<OpenHow>(),
-                )
-            } as RawFd;
+        // Scoped lookups can return EAGAIN for racing renames or mounts.
+        // Retrying the syscall preserves all of its resolution restrictions.
+        retry_policy
+            .retry_openat2(how.is_scoped_lookup(), || {
+                // SAFETY: Obviously safe-to-use Linux syscall.
+                let fd = unsafe {
+                    libc::syscall(
+                        libc::SYS_openat2,
+                        dirfd.as_raw_fd(),
+                        c_path.as_ptr(),
+                        &how as *const OpenHow,
+                        std::mem::size_of::<OpenHow>(),
+                    )
+                } as RawFd;
 
-            let err = if fd < 0 {
-                Some(
-                    IOError::last_os_error()
+                if fd >= 0 {
+                    // SAFETY: A successful openat2 returns a new file
+                    // descriptor.
+                    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                } else {
+                    Err(IOError::last_os_error()
                         .raw_os_error()
                         .map(Errno::from_raw_os_error)
-                        .expect("last_os_error must return a raw OS std::io::Error"),
-                )
-            } else {
-                None
-            };
-
-            // Success.
-            if fd >= 0
-                // Not a scoped lookup (no need to retry).
-                || !how.is_scoped_lookup()
-                // Not a retry-able error.
-                || err != Some(Errno::AGAIN)
-                 // Too many retries.
-                || tries >= MAX_RETRIES
-            {
-                break (fd, err);
-            }
-            tries += 1;
-        };
-
-        if fd >= 0 {
-            // SAFETY: We know it's a real file descriptor.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        } else {
-            Err(Error::Openat2 {
+                        .expect("last_os_error must return a raw OS std::io::Error"))
+                }
+            })
+            .map_err(|source| Error::Openat2 {
                 dirfd: dirfd.into(),
                 path: path.into(),
                 how,
                 size: std::mem::size_of::<OpenHow>(),
-                source: err.expect("syscall failure must result in an error"),
+                source,
             })
-        }
     }
 
     /// Wrapper for `openat2(2)` which auto-sets `O_CLOEXEC | O_NOCTTY |
@@ -935,7 +917,7 @@ pub(crate) mod openat2 {
     }
 }
 
-pub(crate) use openat2::{openat2, openat2_follow, OpenHow, ResolveFlags};
+pub(crate) use openat2::{openat2_follow_with_retry, OpenHow, ResolveFlags};
 
 #[cfg(test)]
 mod personality {

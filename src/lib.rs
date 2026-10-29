@@ -108,6 +108,10 @@ mod root;
 #[doc(inline)]
 pub use root::*;
 
+mod retry;
+#[doc(inline)]
+pub use retry::RetryPolicy;
+
 pub mod error;
 pub mod flags;
 pub mod procfs;
