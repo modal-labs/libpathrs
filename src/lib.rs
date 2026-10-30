@@ -121,6 +121,8 @@ mod capi;
 
 // Internally used helpers.
 mod syscalls;
+#[doc(inline)]
+pub use syscalls::openat2::set_default_retry_limit;
 mod utils;
 
 // Library tests.
