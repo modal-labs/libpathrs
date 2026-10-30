@@ -723,6 +723,42 @@ pub(crate) mod openat2 {
 
     use once_cell::sync::OnceCell;
 
+    static DEFAULT_RETRY_LIMIT: OnceCell<u32> = OnceCell::new();
+
+    fn default_retry_limit() -> u32 {
+        DEFAULT_RETRY_LIMIT.get().copied().unwrap_or(128)
+    }
+
+    /// Set the process-wide retry limit for scoped `openat2(2)` lookups once.
+    ///
+    /// The limit counts retries after the initial attempt. The default is 128
+    /// (129 attempts); zero disables retries. Only `EAGAIN` from scoped lookups
+    /// is retried, immediately without backoff. Exhaustion returns `EAGAIN`.
+    ///
+    /// Applications should call this during startup. Each syscall retry loop
+    /// snapshots the limit, so this affects subsequent loops, including those
+    /// using existing handles and internal helpers. A multi-step operation may
+    /// have several loops, each with its own limit.
+    ///
+    /// The setting is shared by all callers of this library instance, including
+    /// C API calls. Separately linked copies have independent settings.
+    /// Libraries should leave configuration to the application.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(limit)` if already configured, even with the same value.
+    /// Concurrent setters are safe; exactly one succeeds. The setting cannot be
+    /// reset. Lookups before configuration use 128 and do not freeze the
+    /// setting.
+    ///
+    /// ```rust
+    /// pathrs::set_default_retry_limit(1024)
+    ///     .expect("configure libpathrs once at startup");
+    /// ```
+    pub fn set_default_retry_limit(limit: u32) -> Result<(), u32> {
+        DEFAULT_RETRY_LIMIT.set(limit)
+    }
+
     /// Caches whether we've ever seen `openat2(2)` fail with trivial arguments.
     ///
     /// This is a one-way toggle.
@@ -865,13 +901,10 @@ pub(crate) mod openat2 {
         // mount *anywhere on the system*. This can happen pretty frequently, so
         // what we do is attempt the openat2(2) a couple of times.
         //
-        // Based on some fairly extensive tests, with 128 retries you only have
-        // a ~0.1% chance of hitting the error path (even with an attacker
-        // pounding on rename on all cores). Users that need stricter retry
-        // requirements can do their own higher-level retry loop based on the
-        // errno.
-        const MAX_RETRIES: u8 = 128;
-        let mut tries = 0u8;
+        // Snapshot the process-wide limit so concurrent configuration cannot
+        // change the budget of an in-progress retry loop.
+        let max_retries = default_retry_limit();
+        let mut tries = 0u32;
         let (fd, err) = loop {
             // SAFETY: Obviously safe-to-use Linux syscall.
             let fd = unsafe {
@@ -902,7 +935,7 @@ pub(crate) mod openat2 {
                 // Not a retry-able error.
                 || err != Some(Errno::AGAIN)
                  // Too many retries.
-                || tries >= MAX_RETRIES
+                || tries >= max_retries
             {
                 break (fd, err);
             }
@@ -932,6 +965,42 @@ pub(crate) mod openat2 {
     ) -> Result<OwnedFd, Error> {
         how.flags.insert(OpenFlags::O_NOFOLLOW);
         openat2_follow(dirfd, path, how)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn process_retry_limit() {
+            // Run each configuration in a subprocess because the process-wide
+            // setting cannot be reset and must not affect other tests.
+            const CHILD_LIMIT: &str = "LIBPATHRS_TEST_RETRY_LIMIT";
+            let limit = match std::env::var(CHILD_LIMIT) {
+                Ok(value) => value.parse::<u32>().unwrap(),
+                Err(_) => {
+                    for limit in [0, 1024, u32::MAX] {
+                        let status = std::process::Command::new(std::env::current_exe().unwrap())
+                            .args(["--exact", "syscalls::openat2::tests::process_retry_limit"])
+                            .env(CHILD_LIMIT, limit.to_string())
+                            .status()
+                            .unwrap();
+                        assert!(status.success());
+                    }
+                    return;
+                }
+            };
+
+            assert_eq!(default_retry_limit(), 128);
+            let root = crate::Root::open(".").unwrap();
+            root.resolve(".").unwrap();
+            assert_eq!(crate::set_default_retry_limit(limit), Ok(()));
+            assert_eq!(default_retry_limit(), limit);
+            assert_eq!(crate::set_default_retry_limit(limit), Err(limit));
+            assert_eq!(crate::set_default_retry_limit(128), Err(128));
+            assert_eq!(default_retry_limit(), limit);
+            root.resolve(".").unwrap();
+        }
     }
 }
 
